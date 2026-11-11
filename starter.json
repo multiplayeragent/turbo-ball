@@ -1,0 +1,21 @@
+{
+  "name": "Turbo Ball",
+  "genre": "sports",
+  "dim": "3D",
+  "mode": "Versus",
+  "players": "2–8",
+  "hook": "Rocket cars, a giant ball, flip it in the net.",
+  "how": "Drive into the ball to shove it toward the other team's goal. Jump to hit it in the air, jump again to flip into it hard, and grab glowing pads to refill your boost. Most goals after three minutes wins; a tie goes to overtime.",
+  "controls": "WASD or arrows to drive, Space to jump, Shift to boost, C for ball cam, or a thumb stick with Jump and Boost buttons",
+  "uses": [
+    ["Host-run physics", "One player's browser moves the ball and keeps the score, so everyone sees the same bounce; if it leaves, the next player takes over."],
+    ["Leaderboard", "Most goals, for every player."],
+    ["Bots", "Bots fill every empty seat, so it's always at least 3 against 3: one chases, one shadows, one guards the goal."],
+    ["Live sync", "Every car and the ball move for everyone at once."]
+  ],
+  "ideas": [
+    "Add a second ball after each goal",
+    "Make the ball huge and slow, like a beach ball",
+    "Add a speed pad that launches cars into the air"
+  ]
+}
