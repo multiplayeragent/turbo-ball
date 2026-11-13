@@ -44,6 +44,7 @@
   .card h3 { margin: 14px 0 4px; font-size: 14px; color: #ffd23f; text-align: left; }
   .card ol { text-align: left; margin: 0; padding-left: 26px; font-size: 14px; min-height: 22px; }
   .card li span { float: right; font-variant-numeric: tabular-nums; } .card li.me { color: #ffd23f; font-weight: 700; }
+  .card li.note { list-style: none; margin-left: -26px; opacity: .8; } /* a message in place of a list: no "1." in front of it */
   .card p { margin: 8px 0 0; font-size: 13px; opacity: .8; }
   #final { font: 800 20px system-ui, sans-serif; }
   button.go { width: 100%; min-height: 48px; margin-top: 14px; border: 0; border-radius: 12px; background: #ffb02e; color: #2a1600; font: 800 17px system-ui, sans-serif; cursor: pointer; }
@@ -64,7 +65,7 @@
 <div id="over" hidden><div class="card">
   <h2 id="winner"></h2><div id="final"></div>
   <h3>Scorers this match</h3><ol id="scorers"></ol>
-  <h3>Most goals</h3><ol id="board"><li>Loading…</li></ol>
+  <h3>Most goals</h3><ol id="board"><li class="note">Loading…</li></ol>
   <button class="go" id="again">Play again</button><p id="next"></p>
 </div></div>
 <script type="module">
@@ -90,8 +91,8 @@
  *
  * HOW THE MULTIPLAYER WORKS (a relay room: no server code):
  *   - Each player drives its OWN car on its own screen and writes it to its entity: `car`
- *     {x, z, a, h, vx, vz, va, b, f} (a = height, h = heading, b = boosting, f = flipping) about 15
- *     times a second, `hb` (heartbeat) once a second, `rdy` (Play again), `n`/`c` (name, color) once.
+ *     {x, z, a, h, vx, vz, va, b, f, q} (a = height, h = heading, b = boosting, f = flipping, q = boost
+ *     left) about 15 times a second, `hb` (heartbeat) once a second, `rdy` (Play again), `n`/`c` (name, color) once.
  *   - The HOST is the lowest sessionId among live players (heartbeat seen in the last 3s), worked out
  *     every frame. The ball is shared, so the host owns it. Only the host writes the shared fields:
  *       `game` {id, v, phase, teams, score, ko, kickAt, resumeAt, endsAt, left, golden, win, overAt, goals, last}:
@@ -99,7 +100,7 @@
  *              (timestamps). `v` goes up on every write; `ko` counts kickoffs (everyone goes to their spot).
  *       `ball` {x, y, z, vx, vy, vz, h, w, lt, s}: the ball ~15 times a second (h = touches so far,
  *              w = 1 waiting for kickoff / 2 just scored, lt = last toucher, s = write number).
- *       `bots` [{i, x, z, a, h, vx, vz, va, b, f}]: every bot car ~10 times a second.
+ *       `bots` [{i, x, z, a, h, vx, vz, va, b, f, q}]: every bot car ~10 times a second.
  *   - The host moves the ball against the arena, its own car and the bots. Everyone else runs the
  *     ball on their own screen between writes and decides THEIR OWN car's touches: when your car hits
  *     the ball on your screen, it flies at once and you send "hit" {x, y, z, vx, vy, vz, g, ko}; the
@@ -108,7 +109,9 @@
  *   - Someone who joins takes a bot's spot on the team with fewer people, mid-match; someone who
  *     leaves is replaced by a bot. A new host adopts `game`, `ball` and `bots` and carries on.
  *   - Boost pads are per car: a pad you drove over is empty for YOU for a few seconds (the others
- *     still see it full), so pads need no shared state.
+ *     still see it full), so pads need no shared state. When any car's boost (`q`) goes up, every
+ *     screen shows sparks on the pad it took, so you can see bots and other players filling up.
+ *   - Cars bump: each screen works out the knock for the cars it drives (your own; the host's bots).
  *   - ?attract plays offline, bots only, broadcast camera (the preview video is recorded from it).
  *   - Leaderboard "turbo-goals": every goal you score adds 1 to your total.
  */
@@ -157,6 +160,7 @@ const CONFIG = {
   hitUp: 0.6,           // share of a touch's push that goes upward
   maxPop: 22,           // fastest a touch can send the ball upward, m/s
   flipPower: 1.5,       // a flipping car hits this much harder
+  carBump: 0.6,         // car against car: the share of the knock each one takes (0.5 = no bounce at all)
   padSmall: 12, padBig: 100, padSmallMs: 4000, padBigMs: 10000, // boost pads: how much they give, how long they stay empty
   botThink: 160,        // ms between bot decisions
   botError: 2.5,        // how far off bots aim, metres
@@ -278,8 +282,14 @@ function pickPads(c, now) {
     if (Math.hypot(c.x - p.x, c.z - p.z) > (p.big ? 2.6 : 1.8)) return;
     c.boost = Math.min(100, c.boost + (p.big ? CONFIG.padBig : CONFIG.padSmall));
     c.pads[i] = now + (p.big ? CONFIG.padBigMs : CONFIG.padSmallMs);
-    if (c === me) sfx("pad");
+    padFx(i); if (c === me) sfx("pad");
   });
+}
+/** The pad nearest to (x, z), if one is within `reach` metres: its number in PADS, or -1. */
+function padNear(x, z, reach) {
+  let best = -1, bd = reach;
+  PADS.forEach((p, i) => { const d = Math.hypot(x - p.x, z - p.z); if (d < bd) { bd = d; best = i; } });
+  return best;
 }
 
 // ── PHYSICS ─────────────────────────────────────────────────────────────────────────
@@ -353,14 +363,19 @@ function stepCar(c, inp, dt) {
   if (c.y > CONFIG.ceiling - 3) { c.y = CONFIG.ceiling - 3; c.vy = Math.min(0, c.vy); }
   collideArena(c, CR, 0.2, CAR_CY);
 }
-/** Push car `c` out of car `o` (they bump side to side). */
+/** Cars `c` and `o` bump: push `c` out of `o` and share the knock between the two (they weigh the same).
+ *  `o` takes its share here only when this screen drives it (my car, or a bot on the host); another
+ *  person's car, or a bot seen from a screen that isn't the host, takes its share where it is driven. */
 function pushApart(c, o) {
   if (Math.abs(c.y - o.y) > 2.2) return;
   const dx = c.x - o.x, dz = c.z - o.z, d = Math.hypot(dx, dz), min = CR * 2;
   if (d >= min || d < 1e-3) return;
   const nx = dx / d, nz = dz / d, rel = (c.vx - (o.vx || 0)) * nx + (c.vz - (o.vz || 0)) * nz;
   c.x += nx * (min - d) * 0.6; c.z += nz * (min - d) * 0.6;
-  if (rel < 0) { c.vx -= rel * nx * 1.2; c.vz -= rel * nz * 1.2; }
+  if (rel >= 0) return; // already moving apart
+  const j = rel * CONFIG.carBump;
+  c.vx -= j * nx; c.vz -= j * nz;
+  if (o === me || host.bots.get(o.id) === o) { o.vx += j * nx; o.vz += j * nz; }
 }
 
 // ── MATCH (HOST) ────────────────────────────────────────────────────────────────────
@@ -423,7 +438,7 @@ function writeBall(onlyIfMoved) {
   host.lastBody = body; ball.s++;
   net.setShared("ball", body.slice(0, -1) + `,"s":${ball.s}}`);
 }
-const carWire = (c) => ({ x: r1(c.x), z: r1(c.z), a: r1(c.y), h: +c.h.toFixed(2), vx: r1(c.vx), vz: r1(c.vz), va: r1(c.vy), b: c.boosting ? 1 : 0, f: c.flipT > 0 ? 1 : 0 });
+const carWire = (c) => ({ x: r1(c.x), z: r1(c.z), a: r1(c.y), h: +c.h.toFixed(2), vx: r1(c.vx), vz: r1(c.vz), va: r1(c.vy), b: c.boosting ? 1 : 0, f: c.flipT > 0 ? 1 : 0, q: Math.round(c.boost) });
 function writeBots() { host.lastBots = performance.now(); net.setShared("bots", JSON.stringify([...host.bots.values()].map((b) => ({ i: b.id, ...carWire(b) })))); }
 /** Become host: take over the game, the ball and the bots exactly as state has them. */
 function adopt() {
@@ -435,7 +450,7 @@ function adopt() {
   }
   for (const q of parse(S.shared.bots, [])) { const v = views.get(q.i), b = newBotCar(q.i, v ? v.x : q.x, v ? v.z : q.z, v ? v.h : q.h); Object.assign(b, { y: v ? v.y : q.a, vx: q.vx, vy: q.va, vz: q.vz, ground: (v ? v.y : q.a) <= 0.05, boost: 50 }); host.bots.set(q.i, b); } // from where this screen drew them, so they don't jump
 }
-const newBotCar = (id, x, z, h) => Object.assign(newCar(x, z, h), { id, thinkAt: 0, ex: 0, ez: 0, aimZ: 0, stuckT: 0, backUntil: 0, flipAt: 0, useBoost: true });
+const newBotCar = (id, x, z, h) => Object.assign(newCar(x, z, h), { id, thinkAt: 0, ex: 0, ez: 0, aimZ: 0, stuckT: 0, backUntil: 0, flipAt: 0, useBoost: true, parked: false, turnBack: false, inGoal: false });
 /** host.bots holds exactly the bots on the teams. */
 function syncBots(g) {
   for (const id of g.teams.flat()) if (isBot(id) && !host.bots.has(id)) { const k = teamOf(g, id), s = spotOf(k, g.teams[k].indexOf(id), g.teams[k].length); host.bots.set(id, newBotCar(id, s.x, s.z, s.h)); }
@@ -516,7 +531,7 @@ function botTick(b, g, dt, now, t) {
   let inp = { thr: 0, steer: 0, boost: false, jump: false };
   if (g.phase === "play" && t < g.kickAt) { placeCar(b, spotOf(team, g.teams[team].indexOf(b.id), g.teams[team].length)); return; } // waiting for kickoff
   if (g.phase === "play") inp = botPlan(b, g, team, now);
-  if (inp.thr) { // trying to drive but going nowhere for 2s (pinned on a wall, or against another car): back out
+  if (inp.thr && !b.parked) { // trying to drive but going nowhere for 2s (pinned on a wall, or against another car): back out
     if (!b.wdAt) Object.assign(b, { wdAt: now, wdX: b.x, wdZ: b.z });
     else if (now - b.wdAt > 2000) { if (Math.hypot(b.x - b.wdX, b.z - b.wdZ) < 3) b.backUntil = now + 900; b.wdAt = 0; }
   } else b.wdAt = 0;
@@ -573,6 +588,8 @@ function attack(b, dir, clear) {
  *  once there), avoid (steer round the ball instead of through it, so a car going back to defend doesn't knock it into its own goal). */
 function driveTo(b, tx, tz, opts = {}) {
   tx = clamp(tx, -HL + 3, HL - 3); tz = clamp(tz, -HW + 3, HW - 3); // never aim into a wall
+  if (Math.abs(b.x) > HL + 0.5) b.inGoal = true; else if (Math.abs(b.x) < HL - 3) b.inGoal = false;
+  if (b.inGoal) { tx = Math.sign(b.x) * (HL - 6); tz = clamp(tz, -GW + 3.5, GW - 3.5); } // inside a goal: come out through the mouth first (backward if it's nose-in), not through the side net
   if (opts.avoid && ball.y < 7) {
     const ax = tx - b.x, az = tz - b.z, l2 = ax * ax + az * az, t = l2 > 1 ? ((ball.x - b.x) * ax + (ball.z - b.z) * az) / l2 : -1;
     if (t > 0 && t < 1) {
@@ -584,12 +601,18 @@ function driveTo(b, tx, tz, opts = {}) {
   const v = b.vx * Math.sin(b.h) + b.vz * Math.cos(b.h);
   let diff = wrapA(want - b.h), thr = 1, steer = clamp(diff * 2.5, -1, 1);
   if (Math.abs(diff) > 2.1 && d < 16) { thr = -1; steer = -clamp(wrapA(want - b.h - Math.PI) * 2.5, -1, 1); } // it's behind me and close: back up to it
-  if (opts.arrive && d < opts.arrive) {
-    thr = v > 2 ? -0.6 : v < -2 ? 0.6 : 0;
-    if (opts.face && Math.abs(v) < 3) { const fd = wrapA(Math.atan2(opts.face[0] - b.x, opts.face[1] - b.z) - b.h); if (Math.abs(fd) > 0.6) { thr = 0.5; steer = Math.sign(fd); } }
+  b.parked = !!opts.arrive && d < opts.arrive * (b.parked ? 2 : 1); // once on its spot it stays put until the spot has moved well away (no shuffling)
+  if (b.parked) {
+    thr = v > 2 ? -0.6 : v < -2 ? 0.6 : 0; steer = 0;
+    const fd = opts.face ? wrapA(Math.atan2(opts.face[0] - b.x, opts.face[1] - b.z) - b.h) : 0;
+    if (Math.abs(fd) > 0.6) { // turn to face it like a three-point turn: roll forward past the spot, then back, always turning the same way
+      const ahead = dx * Math.sin(b.h) + dz * Math.cos(b.h); // how far in front of the car its spot is
+      if (ahead < -1.5) b.turnBack = true; else if (ahead > 1.5) b.turnBack = false;
+      thr = b.turnBack ? -0.5 : 0.5; steer = Math.sign(fd) * (v < 0 ? -1 : 1); // going backward, the wheel turns the car the other way
+    }
   }
   if (now < b.backUntil) { thr = -1; steer = 1; } // stuck against something: back out
-  else if (thr && Math.abs(v) < 1.5 && b.ground) { b.stuckT += 1 / 60; if (b.stuckT > 1.2) { b.backUntil = now + 700; b.stuckT = 0; } } else b.stuckT = 0;
+  else if (thr && Math.abs(v) < 1.5 && b.ground && !b.parked) { b.stuckT += 1 / 60; if (b.stuckT > 1.2) { b.backUntil = now + 700; b.stuckT = 0; } } else b.stuckT = 0;
   const boost = !!opts.boost && b.useBoost && thr > 0 && Math.abs(diff) < 0.3 && b.boost > 4 && d > 6;
   return { thr, steer, boost, jump: false };
 }
@@ -615,6 +638,7 @@ function myTick(dt, g, now) {
     if (g.phase === "play" && t < g.kickAt) { input.jump = false; me.boosting = false; } // on the spot until GO
     else {
       const inp = myInput();
+      if (g.phase === "over") Object.assign(inp, { thr: 0, steer: 0, boost: false, jump: false }); // full time: the car rolls to a stop behind the results
       if (replay.on && inp.jump) { replay.on = false; inp.jump = false; } // Jump skips the replay
       stepCar(me, inp, dt);
       for (const id of g.teams.flat()) { const o = id !== net.sessionId && carOf(id); if (o) pushApart(me, o); }
@@ -804,6 +828,8 @@ function hitFx(car, x = ball.x, y = ball.y, z = ball.z) {
   if (car === me) shake = Math.max(shake, 0.25);
 }
 function bounceFx(res) { if (res.wall > 8 || res.floor > 9) sfx("bounce", Math.min(1, Math.max(res.wall, res.floor) / 40)); }
+/** A car (mine, a bot's, someone else's) just took boost from pad `i`: sparks fly up from it, so you can see who is filling up. */
+function padFx(i) { const p = PADS[i]; burst(p.x, 0.8, p.z, "#ffd166", p.big ? 26 : 12, p.big ? 11 : 7, 0.55, p.big ? 0.4 : 0.3); }
 function goalFx(team, x, y, z) {
   burst(x, y, z, TEAM_COLORS[team], 170, 34, 1.6, 0.8); burst(x, y, z, "#ffffff", 70, 26, 1.1, 0.5); burst(x, y, z, "#ffd23f", 60, 20, 1.4, 0.6);
   flash.color.set(TEAM_GLOW[team]); flash.position.set(x, y + 3, z); flash.intensity = 900; shake = 1.2; sfx("goal");
@@ -823,9 +849,10 @@ function syncViews(dt) {
     if (!f || typeof f.x !== "number") continue;
     seen.add(id);
     let v = views.get(id);
-    if (!v) { v = { id, x: f.x, y: f.a || 0, z: f.z, h: f.h, vx: 0, vy: 0, vz: 0, tx: f.x, ty: f.a || 0, tz: f.z, th: f.h, raw: null, at: now, boosting: false, flipT: 0, f: 0 }; views.set(id, v); }
+    if (!v) { v = { id, x: f.x, y: f.a || 0, z: f.z, h: f.h, vx: 0, vy: 0, vz: 0, tx: f.x, ty: f.a || 0, tz: f.z, th: f.h, raw: null, at: now, boosting: false, flipT: 0, f: 0, q: +f.q || 0 }; views.set(id, v); }
     if (raw !== v.raw) {
-      Object.assign(v, { tx: f.x, ty: +f.a || 0, tz: f.z, th: +f.h || 0, vx: +f.vx || 0, vy: +f.va || 0, vz: +f.vz || 0, boosting: !!f.b, raw, at: now });
+      if (f.q > v.q && Math.hypot(f.x - v.tx, f.z - v.tz) < 8) { let i = padNear(f.x, f.z, 4.5); if (i < 0) i = padNear(v.tx, v.tz, 4.5); if (i >= 0) padFx(i); } // its boost went up since its last write: it drove over a pad (a kickoff also refills it, but moves the car far)
+      Object.assign(v, { tx: f.x, ty: +f.a || 0, tz: f.z, th: +f.h || 0, vx: +f.vx || 0, vy: +f.va || 0, vz: +f.vz || 0, boosting: !!f.b, q: +f.q || 0, raw, at: now });
       if (f.f && !v.f) v.flipT = CONFIG.flipTime; v.f = f.f ? 1 : 0;
       if (Math.hypot(v.tx - v.x, v.tz - v.z) > 25) { v.x = v.tx; v.y = v.ty; v.z = v.tz; v.h = v.th; } // a kickoff: jump there
     }
@@ -875,6 +902,7 @@ function drawList(g) {
   return out;
 }
 const camPos = new THREE.Vector3(0, 30, 60), camLook = new THREE.Vector3(), lookNow = new THREE.Vector3();
+let camReplay = false; // was the last frame a replay frame?
 function drawWorld(g, dt, now) {
   const list = drawList(g), seen = new Set();
   if (!replay.on) recordFrame(now, list);
@@ -924,9 +952,14 @@ function moveCamera(g, dt, now, rf) {
     camPos.set(p.x - ux * (11 + tall * 4), p.y + 4.6 + tall * 5, p.z - uz * (11 + tall * 4));
     camLook.set(p.x + ux * 6, p.y + 1.4 - tall * 3, p.z + uz * 6);
     if (input.ballCam && ball.w !== 2) camLook.lerp(bp, 0.35);
+    for (const w of WALLS) { // the camera stays inside the walls (out there it would sit in the stands): against a wall it comes closer and rises instead
+      const out = w.nx * camPos.x + w.nz * camPos.z + 1 - (w.end && Math.abs(camPos.z) < GW - 1 ? w.c + GD : w.c);
+      if (out > 0) { camPos.x -= w.nx * out; camPos.z -= w.nz * out; camPos.y += out * 0.5; }
+    }
   }
   camPos.x = clamp(camPos.x, -HL - GD - 20, HL + GD + 20); camPos.z = clamp(camPos.z, -HW - 14, HW + 30); camPos.y = Math.max(1.5, camPos.y);
-  const a = rf ? 1 - Math.pow(0.02, dt) : 1 - Math.pow(0.0008, dt);
+  const cut = !rf !== !camReplay; camReplay = !!rf; // a replay starts or ends: cut to the new camera (flying there would go through the ball)
+  const a = cut ? 1 : rf ? 1 - Math.pow(0.02, dt) : 1 - Math.pow(0.0008, dt);
   camera.position.lerp(camPos, a); lookNow.lerp(camLook, a); camera.lookAt(lookNow);
   shake *= Math.exp(-dt * 6);
   if (shake > 0.01) camera.position.add(tmpV.set((Math.random() - 0.5) * shake, (Math.random() - 0.5) * shake, (Math.random() - 0.5) * shake));
@@ -1011,7 +1044,7 @@ function hud(g, now) {
     $("winner").style.color = g.win >= 0 ? TEAM_COLORS[g.win] : "#fff";
     $("final").innerHTML = `<span style="color:${TEAM_COLORS[0]}">${TEAM_NAMES[0]}</span> ${g.score[0]} – ${g.score[1]} <span style="color:${TEAM_COLORS[1]}">${TEAM_NAMES[1]}</span>`;
     const scorers = Object.entries(g.goals || {}).sort((a, b) => b[1][0] - a[1][0]);
-    $("scorers").innerHTML = scorers.length ? scorers.map(([id, [n, name]]) => `<li class="${id === net.sessionId ? "me" : ""}">${esc(id === net.sessionId ? "You" : name)}<span>${n}</span></li>`).join("") : "<li>Nobody scored.</li>";
+    $("scorers").innerHTML = scorers.length ? scorers.map(([id, [n, name]]) => `<li class="${id === net.sessionId ? "me" : ""}">${esc(id === net.sessionId ? "You" : name)}<span>${n}</span></li>`).join("") : `<li class="note">Nobody scored.</li>`;
     $("again").hidden = team < 0;
     $("again").textContent = myReady === g.id ? "Waiting for the others…" : "Play again";
     $("next").textContent = `Next match in ${Math.max(0, Math.ceil((g.overAt - t) / 1000))}s`;
@@ -1020,11 +1053,11 @@ function hud(g, now) {
 }
 function showBoard(myGoals) {
   const list = $("board");
-  if (!board) { list.innerHTML = "<li>Leaderboards need a connection.</li>"; return; }
-  list.innerHTML = "<li>Loading…</li>";
+  if (!board) { list.innerHTML = `<li class="note">Leaderboards need a connection.</li>`; return; }
+  list.innerHTML = `<li class="note">Loading…</li>`;
   (myGoals > 0 ? board.submit(myGoals, "inc").catch(() => null) : Promise.resolve()).then(() => board.top(10)).then(({ entries }) => {
-    list.innerHTML = entries.length ? entries.map((e) => `<li>${esc(e.username || "Player")}<span>${e.score}</span></li>`).join("") : "<li>No goals yet. Be the first.</li>";
-  }).catch(() => { list.innerHTML = "<li>Couldn't load the leaderboard.</li>"; });
+    list.innerHTML = entries.length ? entries.map((e) => `<li>${esc(e.username || "Player")}<span>${e.score}</span></li>`).join("") : `<li class="note">No goals yet. Be the first.</li>`;
+  }).catch(() => { list.innerHTML = `<li class="note">Couldn't load the leaderboard.</li>`; });
 }
 $("again").onclick = () => { const g = game(); if (g && g.phase === "over") { myReady = g.id; net.me.set("rdy", g.id); } };
 
